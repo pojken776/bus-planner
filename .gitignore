@@ -7,6 +7,8 @@
 *.dll
 *.so
 *.dylib
+# Binaries
+slbot
 
 # Test binary, built with `go test -c`
 *.test
@@ -24,8 +26,10 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
+# Runtime data & secrets
+data/
 .env
+.env.local
 
 # Editor/IDE
 # .idea/

@@ -1,0 +1,40 @@
+{
+  "departures": [
+    {
+      "scheduled": "2025-12-27T17:45:00Z",
+      "expected": "2025-12-27T17:45:15Z",
+      "line": "1",
+      "direction": "Skärholmen",
+      "displayText": "1",
+      "stopArea": {
+        "name": "Storgatan",
+        "siteId": 3484
+      },
+      "deviations": []
+    },
+    {
+      "scheduled": "2025-12-27T18:00:00Z",
+      "expected": "2025-12-27T18:00:00Z",
+      "line": "1",
+      "direction": "Skärholmen",
+      "displayText": "1",
+      "stopArea": {
+        "name": "Storgatan",
+        "siteId": 3484
+      },
+      "deviations": []
+    },
+    {
+      "scheduled": "2025-12-27T18:15:00Z",
+      "expected": "2025-12-27T18:12:00Z",
+      "line": "1",
+      "direction": "Skärholmen",
+      "displayText": "1",
+      "stopArea": {
+        "name": "Storgatan",
+        "siteId": 3484
+      },
+      "deviations": []
+    }
+  ]
+}
