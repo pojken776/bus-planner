@@ -8,17 +8,19 @@ import (
 	"sync"
 )
 
-// UserPreferences holds a user's site ID choices.
+// UserPreferences holds a user's location choices.
+// Locations can be addresses, site names, or coordinates.
 type UserPreferences struct {
-	HomeSiteID string `json:"homeSiteID"`
-	WorkSiteID string `json:"workSiteID"`
+	HomeLocation  string `json:"homeLocation"`
+	WorkLocation  string `json:"workLocation"`
+	RoutePriority string `json:"routePriority,omitempty"` // leastinterchange, leasttime, or leastwalking
 }
 
 // UserStore manages user preferences in memory and optionally persists to a JSON file.
 type UserStore struct {
 	mu    sync.RWMutex
 	prefs map[int64]*UserPreferences // map of userID -> preferences
-	file  string                      // path to persistence file (optional)
+	file  string                     // path to persistence file (optional)
 }
 
 // NewUserStore creates a new in-memory user store.
@@ -59,28 +61,41 @@ func (s *UserStore) GetPrefs(userID int64) UserPreferences {
 	return UserPreferences{}
 }
 
-// SetHome sets a user's home site ID.
-func (s *UserStore) SetHome(userID int64, siteID string) error {
+// SetHome sets a user's home location.
+func (s *UserStore) SetHome(userID int64, location string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, exists := s.prefs[userID]; !exists {
 		s.prefs[userID] = &UserPreferences{}
 	}
-	s.prefs[userID].HomeSiteID = siteID
+	s.prefs[userID].HomeLocation = location
 
 	return s.saveToFile()
 }
 
-// SetWork sets a user's work site ID.
-func (s *UserStore) SetWork(userID int64, siteID string) error {
+// SetWork sets a user's work location.
+func (s *UserStore) SetWork(userID int64, location string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, exists := s.prefs[userID]; !exists {
 		s.prefs[userID] = &UserPreferences{}
 	}
-	s.prefs[userID].WorkSiteID = siteID
+	s.prefs[userID].WorkLocation = location
+
+	return s.saveToFile()
+}
+
+// SetPriority sets a user's route priority preference.
+func (s *UserStore) SetPriority(userID int64, priority string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.prefs[userID]; !exists {
+		s.prefs[userID] = &UserPreferences{}
+	}
+	s.prefs[userID].RoutePriority = priority
 
 	return s.saveToFile()
 }

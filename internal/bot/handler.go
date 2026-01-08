@@ -9,36 +9,33 @@ import (
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/mahmad/slbot/internal/sl"
+	"github.com/mahmad/slbot/internal/journeyplanner"
 	"github.com/mahmad/slbot/internal/store"
 )
 
 // Handler processes Telegram messages and coordinates bot logic.
-// It receives the SL client and site IDs via dependency injection.
+// It receives the Journey Planner client and default locations via dependency injection.
 type Handler struct {
-	slClient   *sl.Client
+	jpClient   *journeyplanner.Client
 	homeSiteID string
 	workSiteID string
 	userStore  *store.UserStore
-	sites      []sl.Site // cached sites list
 
-	// For button callbacks: store pending site selections
-	// Maps userID to available sites for home/work selection
-	pendingHome map[int64][]sl.Site
-	pendingWork map[int64][]sl.Site
+	// For button callbacks: store pending location selections.
+	pendingHome map[int64][]journeyplanner.Location
+	pendingWork map[int64][]journeyplanner.Location
 	mu          sync.RWMutex // protect concurrent map access
 }
 
 // NewHandler constructs a Handler.
-func NewHandler(slClient *sl.Client, homeSiteID, workSiteID string, userStore *store.UserStore) *Handler {
+func NewHandler(jpClient *journeyplanner.Client, homeSiteID, workSiteID string, userStore *store.UserStore) *Handler {
 	return &Handler{
-		slClient:    slClient,
+		jpClient:    jpClient,
 		homeSiteID:  homeSiteID,
 		workSiteID:  workSiteID,
 		userStore:   userStore,
-		sites:       []sl.Site{},
-		pendingHome: make(map[int64][]sl.Site),
-		pendingWork: make(map[int64][]sl.Site),
+		pendingHome: make(map[int64][]journeyplanner.Location),
+		pendingWork: make(map[int64][]journeyplanner.Location),
 	}
 }
 
@@ -61,12 +58,20 @@ func (h *Handler) HandleMessage(ctx context.Context, api *tgbotapi.BotAPI, msg *
 		h.handleHelp(api, msg.Chat.ID)
 	case text == "/prefs":
 		h.handlePrefs(ctx, api, msg.Chat.ID, msg.From.ID)
-	case strings.HasPrefix(text, "/sethome "):
-		query := strings.TrimPrefix(text, "/sethome ")
+	case strings.HasPrefix(text, "/sethome"):
+		query := strings.TrimPrefix(text, "/sethome")
+		query = strings.TrimSpace(query)
 		h.handleSetHome(ctx, api, msg.Chat.ID, msg.From.ID, query)
-	case strings.HasPrefix(text, "/setwork "):
-		query := strings.TrimPrefix(text, "/setwork ")
+	case strings.HasPrefix(text, "/setwork"):
+		query := strings.TrimPrefix(text, "/setwork")
+		query = strings.TrimSpace(query)
 		h.handleSetWork(ctx, api, msg.Chat.ID, msg.From.ID, query)
+	case text == "/setpriority":
+		h.handleSetPriority(ctx, api, msg.Chat.ID, msg.From.ID)
+	case strings.HasPrefix(text, "/track"):
+		args := strings.TrimPrefix(text, "/track")
+		args = strings.TrimSpace(args)
+		h.handleTrack(api, msg.Chat.ID, args)
 	default:
 		h.handleUnknown(api, msg.Chat.ID)
 	}
@@ -74,123 +79,128 @@ func (h *Handler) HandleMessage(ctx context.Context, api *tgbotapi.BotAPI, msg *
 
 // handleToWork fetches departures for the work site and sends them as a Telegram message.
 func (h *Handler) handleToWork(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64) {
-	// Check user's saved work site; fall back to default (from env or constructor)
-	workSiteID := h.workSiteID
-	if prefs := h.userStore.GetPrefs(userID); prefs.WorkSiteID != "" {
-		workSiteID = prefs.WorkSiteID
+	prefs := h.userStore.GetPrefs(userID)
+	origin := prefs.HomeLocation
+	if origin == "" {
+		origin = h.homeSiteID
+	}
+	destination := prefs.WorkLocation
+	if destination == "" {
+		destination = h.workSiteID
 	}
 
-	departures, err := h.slClient.GetDepartures(ctx, workSiteID)
-	if err != nil {
-		log.Printf("error fetching work departures: %v", err)
-		h.sendMessage(api, chatID, "❌ Error fetching work departures. Try again later.")
+	if origin == "" || destination == "" {
+		h.sendMessage(api, chatID, "❓ Set your locations first: /sethome <location> and /setwork <location>.")
 		return
 	}
 
-	formatted := sl.FormatDepartures(departures, 3)
-	message := fmt.Sprintf("🚌 Next buses to work:\n\n%s", formatted)
-	h.sendMessage(api, chatID, message)
+	routeType := prefs.RoutePriority
+
+	journeys, err := h.jpClient.Trips(ctx, origin, destination, 3, routeType)
+	if err != nil {
+		log.Printf("error fetching trips home->work: %v", err)
+		h.sendMessage(api, chatID, "❌ Error fetching trips. Try again later.")
+		return
+	}
+
+	originLabel := h.locationLabel(ctx, origin)
+	destinationLabel := h.locationLabel(ctx, destination)
+	formatted := journeyplanner.FormatJourneys(originLabel, destinationLabel, journeys, 3)
+	h.sendMessage(api, chatID, formatted)
 }
 
 // handleToHome fetches departures for the home site and sends them as a Telegram message.
 func (h *Handler) handleToHome(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64) {
-	// Check user's saved home site; fall back to default (from env or constructor)
-	homeSiteID := h.homeSiteID
-	if prefs := h.userStore.GetPrefs(userID); prefs.HomeSiteID != "" {
-		homeSiteID = prefs.HomeSiteID
+	prefs := h.userStore.GetPrefs(userID)
+	origin := prefs.WorkLocation
+	if origin == "" {
+		origin = h.workSiteID
+	}
+	destination := prefs.HomeLocation
+	if destination == "" {
+		destination = h.homeSiteID
 	}
 
-	departures, err := h.slClient.GetDepartures(ctx, homeSiteID)
-	if err != nil {
-		log.Printf("error fetching home departures: %v", err)
-		h.sendMessage(api, chatID, "❌ Error fetching home departures. Try again later.")
+	if origin == "" || destination == "" {
+		h.sendMessage(api, chatID, "❓ Set your locations first: /sethome <location> and /setwork <location>.")
 		return
 	}
 
-	formatted := sl.FormatDepartures(departures, 3)
-	message := fmt.Sprintf("🚌 Next buses to home:\n\n%s", formatted)
-	h.sendMessage(api, chatID, message)
+	routeType := prefs.RoutePriority
+
+	journeys, err := h.jpClient.Trips(ctx, origin, destination, 3, routeType)
+	if err != nil {
+		log.Printf("error fetching trips work->home: %v", err)
+		h.sendMessage(api, chatID, "❌ Error fetching trips. Try again later.")
+		return
+	}
+
+	originLabel := h.locationLabel(ctx, origin)
+	destinationLabel := h.locationLabel(ctx, destination)
+	formatted := journeyplanner.FormatJourneys(originLabel, destinationLabel, journeys, 3)
+	h.sendMessage(api, chatID, formatted)
 }
 
 // handleHelp sends the help message listing all available commands.
 func (h *Handler) handleHelp(api *tgbotapi.BotAPI, chatID int64) {
 	help := `Available commands:
-• to work - Next buses to work
-• to home - Next buses to home
-• /sethome <location> - Set your home bus stop
-• /setwork <location> - Set your work bus stop
-• /prefs - Show saved home/work preferences
-• /help - Show this message`
+• to work - Next trips from home to work
+• to home - Next trips from work to home
+• /sethome <location> - Set your home location
+• /setwork <location> - Set your work location
+• /setpriority - Set route preference (fastest (default) / least transfers / least walking)
+• /track <line> [direction] - Open SL app tracker for a specific line (e.g., /track 509 Danderyds Sjukhus)
+• /prefs - Show saved locations and preferences
+• /help - Show this message
+
+Location examples:
+• Address: "Drottninggatan 1, Stockholm"
+• Stop name: "Odenplan"
+• Coordinates: "18.013809:59.335104:WGS84[dd.ddddd]"`
 	h.sendMessage(api, chatID, help)
 }
 
 // handleSetHome prompts the user to select their home stop.
 func (h *Handler) handleSetHome(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64, query string) {
 	if query == "" {
-		h.sendMessage(api, chatID, "❓ Usage: /sethome <location name>")
+		h.sendMessage(api, chatID, "❓ Usage: /sethome <location>\n\nExamples:\n• /sethome Odenplan\n• /sethome Drottninggatan 1, Stockholm")
 		return
 	}
 
-	log.Printf("handleSetHome: user=%d query=%q cached_sites=%d", userID, query, len(h.sites))
+	log.Printf("handleSetHome: user=%d query=%q", userID, query)
 
-	// Load sites if not already cached.
-	if len(h.sites) == 0 {
-		sites, err := h.slClient.GetSites(ctx)
-		if err != nil {
-			log.Printf("handleSetHome: error fetching sites: %v", err)
-			h.sendMessage(api, chatID, "❌ Error fetching sites. Try again later.")
-			return
-		}
-		h.sites = sites
-		log.Printf("handleSetHome: fetched %d sites", len(h.sites))
-		// Log site list (limit to first 200 entries)
-		max := len(h.sites)
-		if max > 200 {
-			max = 200
-		}
-		for i := 0; i < max; i++ {
-			s := h.sites[i]
-			log.Printf("handleSetHome: site %d: %s (id=%d)", i, s.Name, s.SiteID)
-		}
+	locs, err := h.jpClient.StopFinder(ctx, query, 5)
+	if err != nil {
+		log.Printf("handleSetHome: stop-finder error: %v", err)
+		h.sendMessage(api, chatID, "❌ Error searching locations. Try again later.")
+		return
 	}
-
-	// Fuzzy match the query.
-	matches := sl.FuzzyMatch(query, h.sites, 3)
-	log.Printf("handleSetHome: matches=%d", len(matches))
-	if len(matches) == 0 {
-		h.sendMessage(api, chatID, fmt.Sprintf("❌ No sites found matching '%s'", query))
+	if len(locs) == 0 {
+		h.sendMessage(api, chatID, fmt.Sprintf("❌ No locations found matching '%s'", query))
 		return
 	}
 
-	// Log match details
-	for i, m := range matches {
-		log.Printf("handleSetHome: match %d: %s (site %d)", i, m.Name, m.SiteID)
-	}
-
-	// If only one match, save it directly
-	if len(matches) == 1 {
-		selected := matches[0]
-		if err := h.userStore.SetHome(userID, fmt.Sprintf("%d", selected.SiteID)); err != nil {
+	if len(locs) == 1 {
+		selected := locs[0]
+		if err := h.userStore.SetHome(userID, selected.ID); err != nil {
 			log.Printf("handleSetHome: error setting home: %v", err)
 			h.sendMessage(api, chatID, "❌ Error saving preference. Try again later.")
 			return
 		}
-		log.Printf("handleSetHome: saved home site %d for user %d", selected.SiteID, userID)
 		h.sendMessage(api, chatID, fmt.Sprintf("✅ Home set to: %s", selected.Name))
 		return
 	}
 
-	// Multiple matches: store and show buttons
 	h.mu.Lock()
-	h.pendingHome[userID] = matches
+	h.pendingHome[userID] = locs
 	h.mu.Unlock()
 
-	// Create inline buttons for each match
 	var buttons [][]tgbotapi.InlineKeyboardButton
-	for _, site := range matches {
+	for i, loc := range locs {
+		label := fmt.Sprintf("%s (%s)", loc.Name, loc.Type)
 		button := tgbotapi.NewInlineKeyboardButtonData(
-			site.Name,
-			fmt.Sprintf("home_%d_%d", userID, site.SiteID),
+			label,
+			fmt.Sprintf("homejp_%d_%d", userID, i),
 		)
 		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{button})
 	}
@@ -206,69 +216,44 @@ func (h *Handler) handleSetHome(ctx context.Context, api *tgbotapi.BotAPI, chatI
 // handleSetWork prompts the user to select their work stop.
 func (h *Handler) handleSetWork(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64, query string) {
 	if query == "" {
-		h.sendMessage(api, chatID, "❓ Usage: /setwork <location name>")
+		h.sendMessage(api, chatID, "❓ Usage: /setwork <location>\n\nExamples:\n• /setwork Slussen\n• /setwork Kungsgatan 10, Stockholm")
 		return
 	}
 
-	log.Printf("handleSetWork: user=%d query=%q cached_sites=%d", userID, query, len(h.sites))
+	log.Printf("handleSetWork: user=%d query=%q", userID, query)
 
-	// Load sites if not already cached.
-	if len(h.sites) == 0 {
-		sites, err := h.slClient.GetSites(ctx)
-		if err != nil {
-			log.Printf("handleSetWork: error fetching sites: %v", err)
-			h.sendMessage(api, chatID, "❌ Error fetching sites. Try again later.")
-			return
-		}
-		h.sites = sites
-		log.Printf("handleSetWork: fetched %d sites", len(h.sites))
-		// Log site list (limit to first 200 entries)
-		max := len(h.sites)
-		if max > 200 {
-			max = 200
-		}
-		for i := 0; i < max; i++ {
-			s := h.sites[i]
-			log.Printf("handleSetWork: site %d: %s (id=%d)", i, s.Name, s.SiteID)
-		}
+	locs, err := h.jpClient.StopFinder(ctx, query, 5)
+	if err != nil {
+		log.Printf("handleSetWork: stop-finder error: %v", err)
+		h.sendMessage(api, chatID, "❌ Error searching locations. Try again later.")
+		return
 	}
-
-	// Fuzzy match the query.
-	matches := sl.FuzzyMatch(query, h.sites, 3)
-	log.Printf("handleSetWork: matches=%d", len(matches))
-	if len(matches) == 0 {
-		h.sendMessage(api, chatID, fmt.Sprintf("❌ No sites found matching '%s'", query))
+	if len(locs) == 0 {
+		h.sendMessage(api, chatID, fmt.Sprintf("❌ No locations found matching '%s'", query))
 		return
 	}
 
-	for i, m := range matches {
-		log.Printf("handleSetWork: match %d: %s (site %d)", i, m.Name, m.SiteID)
-	}
-
-	// If only one match, save it directly
-	if len(matches) == 1 {
-		selected := matches[0]
-		if err := h.userStore.SetWork(userID, fmt.Sprintf("%d", selected.SiteID)); err != nil {
+	if len(locs) == 1 {
+		selected := locs[0]
+		if err := h.userStore.SetWork(userID, selected.ID); err != nil {
 			log.Printf("handleSetWork: error setting work: %v", err)
 			h.sendMessage(api, chatID, "❌ Error saving preference. Try again later.")
 			return
 		}
-		log.Printf("handleSetWork: saved work site %d for user %d", selected.SiteID, userID)
 		h.sendMessage(api, chatID, fmt.Sprintf("✅ Work set to: %s", selected.Name))
 		return
 	}
 
-	// Multiple matches: store and show buttons
 	h.mu.Lock()
-	h.pendingWork[userID] = matches
+	h.pendingWork[userID] = locs
 	h.mu.Unlock()
 
-	// Create inline buttons for each match
 	var buttons [][]tgbotapi.InlineKeyboardButton
-	for _, site := range matches {
+	for i, loc := range locs {
+		label := fmt.Sprintf("%s (%s)", loc.Name, loc.Type)
 		button := tgbotapi.NewInlineKeyboardButtonData(
-			site.Name,
-			fmt.Sprintf("work_%d_%d", userID, site.SiteID),
+			label,
+			fmt.Sprintf("workjp_%d_%d", userID, i),
 		)
 		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{button})
 	}
@@ -285,50 +270,74 @@ func (h *Handler) handleSetWork(ctx context.Context, api *tgbotapi.BotAPI, chatI
 func (h *Handler) handlePrefs(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64) {
 	prefs := h.userStore.GetPrefs(userID)
 
-	homeSite := prefs.HomeSiteID
+	homeLocation := prefs.HomeLocation
 	homeNote := "(saved)"
-	if homeSite == "" {
-		homeSite = h.homeSiteID
+	if homeLocation == "" {
+		homeLocation = h.homeSiteID
 		homeNote = "(default)"
 	}
-	homeName := h.siteNameByID(ctx, homeSite)
 
-	workSite := prefs.WorkSiteID
+	workLocation := prefs.WorkLocation
 	workNote := "(saved)"
-	if workSite == "" {
-		workSite = h.workSiteID
+	if workLocation == "" {
+		workLocation = h.workSiteID
 		workNote = "(default)"
 	}
-	workName := h.siteNameByID(ctx, workSite)
 
-	msg := fmt.Sprintf("Your preferences:\nHome: %s %s (site %s)\nWork: %s %s (site %s)\n\nChange with /sethome <name> and /setwork <name>",
-		homeName, homeNote, homeSite, workName, workNote, workSite)
+	homeLocation = h.locationLabel(ctx, homeLocation)
+	workLocation = h.locationLabel(ctx, workLocation)
+
+	priority := prefs.RoutePriority
+	priorityNote := ""
+	if priority == "" {
+		priority = "Not set (using default)"
+	} else {
+		priorityNote = "(saved)"
+		switch priority {
+		case "leastinterchange":
+			priority = "Least transfers"
+		case "leasttime":
+			priority = "Fastest"
+		case "leastwalking":
+			priority = "Least walking"
+		}
+	}
+
+	msg := fmt.Sprintf("Your preferences:\nHome: %s %s\nWork: %s %s\nRoute priority: %s %s\n\nChange with /sethome, /setwork, and /setpriority",
+		homeLocation, homeNote, workLocation, workNote, priority, priorityNote)
 
 	h.sendMessage(api, chatID, msg)
 }
 
-// siteNameByID returns a friendly site name for a site ID string.
-// It ensures the handler's site cache is populated.
-func (h *Handler) siteNameByID(ctx context.Context, siteID string) string {
-	if len(h.sites) == 0 {
-		sites, err := h.slClient.GetSites(ctx)
-		if err == nil {
-			h.sites = sites
-		}
+func (h *Handler) locationLabel(ctx context.Context, location string) string {
+	location = strings.TrimSpace(location)
+	if location == "" {
+		return ""
+	}
+	locs, err := h.jpClient.StopFinder(ctx, location, 1)
+	if err != nil || len(locs) == 0 {
+		return location
+	}
+	if locs[0].Name == "" {
+		return location
+	}
+	return locs[0].Name
+}
+
+// handleSetPriority shows inline buttons for the user to select route priority.
+func (h *Handler) handleSetPriority(ctx context.Context, api *tgbotapi.BotAPI, chatID int64, userID int64) {
+	buttons := [][]tgbotapi.InlineKeyboardButton{
+		{tgbotapi.NewInlineKeyboardButtonData("⚡ Fastest", fmt.Sprintf("priority_%d_leasttime", userID))},
+		{tgbotapi.NewInlineKeyboardButtonData("🔄 Least transfers", fmt.Sprintf("priority_%d_leastinterchange", userID))},
+		{tgbotapi.NewInlineKeyboardButtonData("🚶 Least walking", fmt.Sprintf("priority_%d_leastwalking", userID))},
 	}
 
-	// siteID is stored as string; SL Site.SiteID is int
-	id, err := strconv.Atoi(siteID)
-	if err == nil {
-		for _, s := range h.sites {
-			if s.SiteID == id {
-				return s.Name
-			}
-		}
+	markup := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	msg := tgbotapi.NewMessage(chatID, "Choose your route priority:")
+	msg.ReplyMarkup = markup
+	if _, err := api.Send(msg); err != nil {
+		log.Printf("handleSetPriority: error sending button message: %v", err)
 	}
-
-	// Fallback: return the raw siteID
-	return siteID
 }
 
 // handleUnknown sends a message when the user sends an unrecognized command.
@@ -337,7 +346,7 @@ func (h *Handler) handleUnknown(api *tgbotapi.BotAPI, chatID int64) {
 }
 
 // HandleCallback processes inline button callbacks (site selection).
-// Expected callback data format: "home_<userID>_<siteID>" or "work_<userID>_<siteID>"
+// Expected callback data format: "home_<userID>_<siteID>" or "work_<userID>_<siteID>" or "priority_<userID>_<value>"
 func (h *Handler) HandleCallback(ctx context.Context, api *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery) {
 	data := callback.Data
 	parts := strings.Split(data, "_")
@@ -352,89 +361,130 @@ func (h *Handler) HandleCallback(ctx context.Context, api *tgbotapi.BotAPI, call
 		log.Printf("HandleCallback: invalid userID: %s", parts[1])
 		return
 	}
-	siteID, err := strconv.Atoi(parts[2])
-	if err != nil {
-		log.Printf("HandleCallback: invalid siteID: %s", parts[2])
+
+	// Handle priority callbacks separately (third part is a string, not an index)
+	if action == "priority" {
+		priorityValue := parts[2]
+
+		if err := h.userStore.SetPriority(userID, priorityValue); err != nil {
+			log.Printf("HandleCallback: error setting priority: %v", err)
+			h.sendMessage(api, callback.Message.Chat.ID, "❌ Error saving preference.")
+			return
+		}
+
+		priorityLabel := ""
+		switch priorityValue {
+		case "leasttime":
+			priorityLabel = "Fastest"
+		case "leastinterchange":
+			priorityLabel = "Least transfers"
+		case "leastwalking":
+			priorityLabel = "Least walking"
+		}
+
+		edit := tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID,
+			fmt.Sprintf("✅ Route priority set to: %s", priorityLabel))
+		if _, err := api.Send(edit); err != nil {
+			log.Printf("HandleCallback: error editing message: %v", err)
+		}
+		log.Printf("HandleCallback: saved priority %q for user %d", priorityValue, userID)
 		return
 	}
 
-	var siteName string
+	// For location callbacks, parse the third part as an index
+	selectionIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		log.Printf("HandleCallback: invalid selection index: %s", parts[2])
+		return
+	}
 
-	if action == "home" {
+	if action == "homejp" {
 		h.mu.RLock()
 		matches := h.pendingHome[userID]
 		h.mu.RUnlock()
 
-		// Find the selected site by ID
-		for _, site := range matches {
-			if site.SiteID == siteID {
-				siteName = site.Name
-				break
-			}
-		}
-
-		if siteName == "" {
-			h.sendMessage(api, callback.Message.Chat.ID, "❌ Site not found in pending selections.")
+		if selectionIndex < 0 || selectionIndex >= len(matches) {
+			h.sendMessage(api, callback.Message.Chat.ID, "❌ Location not found in pending selections.")
 			return
 		}
+		selected := matches[selectionIndex]
 
-		// Save the preference
-		if err := h.userStore.SetHome(userID, fmt.Sprintf("%d", siteID)); err != nil {
+		if err := h.userStore.SetHome(userID, selected.ID); err != nil {
 			log.Printf("HandleCallback: error setting home: %v", err)
 			h.sendMessage(api, callback.Message.Chat.ID, "❌ Error saving preference.")
 			return
 		}
 
-		// Clean up pending
 		h.mu.Lock()
 		delete(h.pendingHome, userID)
 		h.mu.Unlock()
 
-		// Edit the message to show confirmation
 		edit := tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID,
-			fmt.Sprintf("✅ Home set to: %s", siteName))
+			fmt.Sprintf("✅ Home set to: %s", selected.Name))
 		if _, err := api.Send(edit); err != nil {
 			log.Printf("HandleCallback: error editing message: %v", err)
 		}
-		log.Printf("HandleCallback: saved home site %d (%s) for user %d", siteID, siteName, userID)
+		log.Printf("HandleCallback: saved home location %q (%s) for user %d", selected.ID, selected.Name, userID)
+		return
+	}
 
-	} else if action == "work" {
+	if action == "workjp" {
 		h.mu.RLock()
 		matches := h.pendingWork[userID]
 		h.mu.RUnlock()
 
-		// Find the selected site by ID
-		for _, site := range matches {
-			if site.SiteID == siteID {
-				siteName = site.Name
-				break
-			}
-		}
-
-		if siteName == "" {
-			h.sendMessage(api, callback.Message.Chat.ID, "❌ Site not found in pending selections.")
+		if selectionIndex < 0 || selectionIndex >= len(matches) {
+			h.sendMessage(api, callback.Message.Chat.ID, "❌ Location not found in pending selections.")
 			return
 		}
+		selected := matches[selectionIndex]
 
-		// Save the preference
-		if err := h.userStore.SetWork(userID, fmt.Sprintf("%d", siteID)); err != nil {
+		if err := h.userStore.SetWork(userID, selected.ID); err != nil {
 			log.Printf("HandleCallback: error setting work: %v", err)
 			h.sendMessage(api, callback.Message.Chat.ID, "❌ Error saving preference.")
 			return
 		}
 
-		// Clean up pending
 		h.mu.Lock()
 		delete(h.pendingWork, userID)
 		h.mu.Unlock()
 
-		// Edit the message to show confirmation
 		edit := tgbotapi.NewEditMessageText(callback.Message.Chat.ID, callback.Message.MessageID,
-			fmt.Sprintf("✅ Work set to: %s", siteName))
+			fmt.Sprintf("✅ Work set to: %s", selected.Name))
 		if _, err := api.Send(edit); err != nil {
 			log.Printf("HandleCallback: error editing message: %v", err)
 		}
-		log.Printf("HandleCallback: saved work site %d (%s) for user %d", siteID, siteName, userID)
+		log.Printf("HandleCallback: saved work location %q (%s) for user %d", selected.ID, selected.Name, userID)
+		return
+	}
+
+	log.Printf("HandleCallback: unknown action: %s", action)
+}
+
+// handleTrack generates a deep link to the SL app's live tracker.
+// Usage: /track <line> [direction]
+// Example: /track 509 Dan (for Danderyds Sjukhus)
+func (h *Handler) handleTrack(api *tgbotapi.BotAPI, chatID int64, args string) {
+	if args == "" {
+		h.sendMessage(api, chatID, "❓ Usage: /track <line> [direction]\n\nExamples:\n• /track 509\n• /track 509 Danderyds Sjukhus")
+		return
+	}
+
+	parts := strings.Fields(args)
+	line := parts[0]
+
+	// Generate SL app deep link
+	// The SL app uses the format: sl://PT/line/<line_number>
+	url := fmt.Sprintf("sl://PT/line/%s", line)
+
+	// Create message with clickable link to SL app
+	messageText := fmt.Sprintf("🚍 Track line %s\n\n📱 [Open in SL App](%s)", line, url)
+
+	msg := tgbotapi.NewMessage(chatID, messageText)
+	msg.ParseMode = "Markdown"
+
+	if _, err := api.Send(msg); err != nil {
+		log.Printf("error sending track message: %v", err)
 	}
 }
 
@@ -446,9 +496,4 @@ func (h *Handler) sendMessage(api *tgbotapi.BotAPI, chatID int64, text string) {
 	if _, err := api.Send(msg); err != nil {
 		log.Printf("error sending message: %v", err)
 	}
-}
-
-// SetSites allows injecting a pre-fetched list of sites into the handler (used at startup).
-func (h *Handler) SetSites(sites []sl.Site) {
-	h.sites = sites
 }

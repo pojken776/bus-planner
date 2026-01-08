@@ -2,17 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/mahmad/slbot/internal/bot"
-	"github.com/mahmad/slbot/internal/sl"
+	"github.com/mahmad/slbot/internal/journeyplanner"
 	"github.com/mahmad/slbot/internal/store"
 )
 
@@ -20,8 +18,8 @@ import (
 // This is a common pattern in Go: gather all config in one struct.
 type Config struct {
 	TelegramBotToken string
-	HomeSiteID       string
-	WorkSiteID       string
+	HomeLocation     string
+	WorkLocation     string
 	DryRun           bool
 }
 
@@ -33,22 +31,23 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("TELEGRAM_BOT_TOKEN not set")
 	}
 
-	homeSiteID := os.Getenv("HOME_SITE_ID")
-	if homeSiteID == "" {
-		return Config{}, fmt.Errorf("HOME_SITE_ID not set")
+	homeLocation := os.Getenv("HOME_LOCATION")
+	if homeLocation == "" {
+		// Backwards compat with older env var naming.
+		homeLocation = os.Getenv("HOME_SITE_ID")
 	}
 
-	workSiteID := os.Getenv("WORK_SITE_ID")
-	if workSiteID == "" {
-		return Config{}, fmt.Errorf("WORK_SITE_ID not set")
+	workLocation := os.Getenv("WORK_LOCATION")
+	if workLocation == "" {
+		workLocation = os.Getenv("WORK_SITE_ID")
 	}
 
 	dryRun := os.Getenv("SL_DRY_RUN") == "1"
 
 	return Config{
 		TelegramBotToken: token,
-		HomeSiteID:       homeSiteID,
-		WorkSiteID:       workSiteID,
+		HomeLocation:     homeLocation,
+		WorkLocation:     workLocation,
 		DryRun:           dryRun,
 	}, nil
 }
@@ -73,10 +72,10 @@ func main() {
 		},
 	}
 
-	// Create the SL API client.
-	// This is DEPENDENCY INJECTION: the SL client receives its dependencies (httpClient, dryRun flag).
+	// Create the Journey Planner client.
+	// This is DEPENDENCY INJECTION: the client receives its dependencies (httpClient, dryRun flag).
 	// This makes testing easy: you can swap out a fake HTTP client for tests.
-	slClient := sl.NewClient(httpClient, cfg.DryRun)
+	jpClient := journeyplanner.NewClient(httpClient, cfg.DryRun)
 
 	// Create the Telegram bot API.
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
@@ -88,35 +87,13 @@ func main() {
 	log.Printf("Authorized on account @%s\n", api.Self.UserName)
 
 	// Create the user preference store with file persistence.
-	// This stores home/work site IDs per user and persists to disk.
+	// This stores home/work locations and preferences per user and persists to disk.
 	userStore := store.NewUserStore("data/userprefs.json")
 
 	// Create the bot handler.
-	// The handler receives the SL client, user site IDs, and the user store.
+	// The handler receives the Journey Planner client, default locations, and the user store.
 	// This separation lets you test handler logic without touching Telegram.
-	handler := bot.NewHandler(slClient, cfg.HomeSiteID, cfg.WorkSiteID, userStore)
-
-	// Fetch sites on startup and persist a cache to disk for debugging/fast startup.
-	ctxSites, cancelSites := context.WithTimeout(context.Background(), 10*time.Second)
-	sites, err := slClient.GetSites(ctxSites)
-	cancelSites()
-	if err != nil {
-		log.Printf("warning: could not fetch sites on startup: %v", err)
-	} else {
-		handler.SetSites(sites)
-		// Ensure data directory exists and write sites cache.
-		cachePath := "data/sites_cache.json"
-		if dir := filepath.Dir(cachePath); dir != "." {
-			_ = os.MkdirAll(dir, 0o755)
-		}
-		if b, err := json.MarshalIndent(sites, "", "  "); err != nil {
-			log.Printf("error marshalling sites for cache: %v", err)
-		} else if err := os.WriteFile(cachePath, b, 0644); err != nil {
-			log.Printf("error writing sites cache: %v", err)
-		} else {
-			log.Printf("wrote %d sites to %s", len(sites), cachePath)
-		}
-	}
+	handler := bot.NewHandler(jpClient, cfg.HomeLocation, cfg.WorkLocation, userStore)
 
 	// Set up Telegram long polling.
 	// Long polling: bot repeatedly asks Telegram "any new messages for me?"
