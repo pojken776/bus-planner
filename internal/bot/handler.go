@@ -68,10 +68,6 @@ func (h *Handler) HandleMessage(ctx context.Context, api *tgbotapi.BotAPI, msg *
 		h.handleSetWork(ctx, api, msg.Chat.ID, msg.From.ID, query)
 	case text == "/setpriority":
 		h.handleSetPriority(ctx, api, msg.Chat.ID, msg.From.ID)
-	case strings.HasPrefix(text, "/track"):
-		args := strings.TrimPrefix(text, "/track")
-		args = strings.TrimSpace(args)
-		h.handleTrack(api, msg.Chat.ID, args)
 	default:
 		h.handleUnknown(api, msg.Chat.ID)
 	}
@@ -149,7 +145,6 @@ func (h *Handler) handleHelp(api *tgbotapi.BotAPI, chatID int64) {
 • /sethome <location> - Set your home location
 • /setwork <location> - Set your work location
 • /setpriority - Set route preference (fastest (default) / least transfers / least walking)
-• /track <line> [direction] - Open SL app tracker for a specific line (e.g., /track 509 Danderyds Sjukhus)
 • /prefs - Show saved locations and preferences
 • /help - Show this message
 
@@ -459,33 +454,6 @@ func (h *Handler) HandleCallback(ctx context.Context, api *tgbotapi.BotAPI, call
 	}
 
 	log.Printf("HandleCallback: unknown action: %s", action)
-}
-
-// handleTrack generates a deep link to the SL app's live tracker.
-// Usage: /track <line> [direction]
-// Example: /track 509 Dan (for Danderyds Sjukhus)
-func (h *Handler) handleTrack(api *tgbotapi.BotAPI, chatID int64, args string) {
-	if args == "" {
-		h.sendMessage(api, chatID, "❓ Usage: /track <line> [direction]\n\nExamples:\n• /track 509\n• /track 509 Danderyds Sjukhus")
-		return
-	}
-
-	parts := strings.Fields(args)
-	line := parts[0]
-
-	// Generate SL app deep link
-	// The SL app uses the format: sl://PT/line/<line_number>
-	url := fmt.Sprintf("sl://PT/line/%s", line)
-
-	// Create message with clickable link to SL app
-	messageText := fmt.Sprintf("🚍 Track line %s\n\n📱 [Open in SL App](%s)", line, url)
-
-	msg := tgbotapi.NewMessage(chatID, messageText)
-	msg.ParseMode = "Markdown"
-
-	if _, err := api.Send(msg); err != nil {
-		log.Printf("error sending track message: %v", err)
-	}
 }
 
 // sendMessage is a helper to send a Telegram message.
